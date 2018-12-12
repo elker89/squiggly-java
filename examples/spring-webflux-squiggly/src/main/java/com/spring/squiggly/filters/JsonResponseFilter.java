@@ -1,5 +1,6 @@
 package com.spring.squiggly.filters;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.bohnman.squiggly.Squiggly;
 import com.github.bohnman.squiggly.util.SquigglyUtils;
@@ -25,6 +26,7 @@ import org.springframework.web.server.WebFilterChain;
 
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 
 @Component
@@ -53,13 +55,13 @@ public final class JsonResponseFilter implements WebFilter {
 
   private class SquigglyServerResponseDecorator extends ServerHttpResponseDecorator {
 
-    private ObjectMapper objectMapper;
+    private ThreadLocal<ObjectMapper> context;
 
     private SquigglyServerResponseDecorator(ServerHttpResponse source,
                                             String fields,
                                             ObjectMapper objectMapper) {
       super(source);
-      this.objectMapper = Squiggly.init(objectMapper, fields);
+      context = ThreadLocal.withInitial(() -> Squiggly.init(objectMapper, fields));
       log.trace("@@@ Applying json response filter [{}]", fields);
     }
 
@@ -67,33 +69,32 @@ public final class JsonResponseFilter implements WebFilter {
     public Mono<Void> writeWith(Publisher<? extends DataBuffer> body) {
       return body instanceof Flux ?
           super.writeWith(((Flux) body)
-              .compose(this.dataBufferOperator())) :
+              .compose(dataBufferOperator())) :
           super.writeWith(body);
     }
 
     private UnaryOperator<Flux<DataBuffer>> dataBufferOperator() {
-
       return (source) -> source
-          .map(this::dataBufferAsByteArray)
-          .map((buffer) -> super.bufferFactory()
-              .wrap(this.applySquigglyFilter(buffer, objectMapper)));
+          .publishOn(Schedulers.parallel())
+          .map((buffer) -> bufferFactory()
+              .wrap(applySquigglyFilter(buffer)));
     }
 
-    private byte[] dataBufferAsByteArray(DataBuffer buffer) {
-      byte[] bytes = new byte[buffer.readableByteCount()];
-      buffer.read(bytes);
-      return bytes;
-    }
 
-    private byte[] applySquigglyFilter(byte[] input, ObjectMapper mapper) {
+    private byte[] applySquigglyFilter(DataBuffer buffer) {
       try {
+        ObjectMapper mapper = context.get();
         return SquigglyUtils
             .stringify(mapper, mapper
-                .readValue(input, Object.class))
+                .readValue(buffer.asInputStream(), new TypeReference<Object>() {
+                }))
             .getBytes(StandardCharsets.UTF_8);
-      } catch (Throwable var4) {
-        JsonResponseFilter.log.trace("@@@ Error applying json response filter...", var4);
-        return input;
+      } catch (Throwable ex) {
+        JsonResponseFilter.log.trace("@@@ Error applying json response filter...", ex);
+
+        byte[] original = new byte[buffer.readableByteCount()];
+        buffer.read(original);
+        return original;
       }
     }
 
@@ -102,7 +103,7 @@ public final class JsonResponseFilter implements WebFilter {
       return body instanceof Flux ?
           super.writeAndFlushWith(((Flux) body)
               .flatMap(Function.identity())
-              .compose(this.dataBufferOperator())
+              .compose(dataBufferOperator())
               .map(Flux::just)) :
           super.writeAndFlushWith(body);
     }
